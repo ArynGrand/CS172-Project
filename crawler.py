@@ -3,6 +3,8 @@ import os
 from dotenv import load_dotenv
 import json
 from multiprocessing import Manager, Process, Value
+import requests
+from bs4 import BeautifulSoup
 import time
 
 # root needs a .env file with:
@@ -159,16 +161,55 @@ class Crawler:
     # Raises ParseErrors if something goes wrong
     # If a comment or post has a link to a subreddit instead of a post,
     # do something like get the 100 newest posts, or 100 hottes posts, etc
+
     def parse_submission(self, submission):
         submission.comments.replace_more(limit=0)
-        comments = [comment.body for comment in 
-                    submission.comments.list()]
-        
-        # how to raise ParseError
-        # raise ParseError("some parse_submission error")
+        comments = [comment.body for comment in submission.comments.list()]
+        urls_in_text = [submission.url] if submission.url.startswith("http") else []
+
+        html_title = self.get_html_title(submission.url) if submission.url.startswith("http") and not submission.url.endswith(".jpg") else None
+
+        post_dict = {
+            "id": submission.id,
+            "title": submission.title,
+            "author": str(submission.author),
+            "score": submission.score,
+            "subreddit": submission.subreddit.display_name,
+            "created_utc": submission.created_utc,
+            "url": submission.url,
+            "selftext": submission.selftext,
+            "num_comments": submission.num_comments,
+            "comments": comments,
+        }
+
+        if html_title:
+            post_dict["url_title"] = html_title
+
+        self.save_to_json(post_dict)
 
         if self.debug:
-            print(f"Thread {self.thread_id} found {len(comments)} comments.")
+            print(f"Thread {self.thread_id} saved post: {submission.id}")
 
+    def get_html_title(self, url):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.ok:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                return soup.title.string.strip() if soup.title else None
+        except Exception as e:
+            if self.debug:
+                print(f"Error fetching title for {url}: {e}")
+        return None
+
+    def save_to_json(self, post_dict):
+        os.makedirs(self.output_dir, exist_ok=True)
+        file_prefix = os.path.join(self.output_dir, "reddit_data")
+        file_index = 0
+        while os.path.exists(f"{file_prefix}_{file_index}.json") and os.path.getsize(f"{file_prefix}_{file_index}.json") >= 10 * 1024 * 1024:
+            file_index += 1
+        with open(f"{file_prefix}_{file_index}.json", 'a', encoding='utf-8') as f:
+            json.dump(post_dict, f)
+            f.write("\n")
 if __name__ == "__main__":
     crawler = Crawler("seeds.txt", 100, 2, "output", 2, 2, True)
