@@ -6,6 +6,7 @@ from multiprocessing import Manager, Process, Value
 import requests
 from bs4 import BeautifulSoup
 import time
+import re #package for reg ex expressions
 
 # root needs a .env file with:
 # CLIENT_ID, CLIENT_SECRET, USER_AGENT, USER_ID, USER_PASS
@@ -70,6 +71,7 @@ class Crawler:
 
     # Create a PRAW Reddit instance using credentials from .env file
     def get_reddit(self):
+        
         reddit = praw.Reddit(
             client_id=os.getenv("CLIENT_ID"),
             client_secret=os.getenv("CLIENT_SECRET"),
@@ -77,6 +79,8 @@ class Crawler:
             username=os.getenv("USER_ID"),
             password=os.getenv("USER_PASS"),
         )
+        print("Authenticated as:", reddit.user.me())
+
         if not reddit:
             print("Reddit instance not created. Check your credentials.")
             exit(1)
@@ -161,31 +165,41 @@ class Crawler:
     # Raises ParseErrors if something goes wrong
     # If a comment or post has a link to a subreddit instead of a post,
     # do something like get the 100 newest posts, or 100 hottes posts, etc
+    #extracting all the urls from a post/comment
 
+    def extract_subreddits(self, text: str) -> list[str]:
+        pattern = re.compile(r'/r/([A-Za-z0-9_]+)')
+        # findall returns a list of capture‐group strings
+        return pattern.findall(text)
+    
+    def extract_urls(self, text: str) -> list[str]:
+        URL_REGEX = re.compile(
+            r'(https?://[^\s]+)|(www\.[^\s]+)',
+            flags=re.IGNORECASE
+        )
+        matches = URL_REGEX.findall(text)
+        return [m[0] or m[1] for m in matches]
+    
     def parse_submission(self, submission):
-        submission.comments.replace_more(limit=0)
-        comments = [comment.body for comment in submission.comments.list()]
-        urls_in_text = [submission.url] if submission.url.startswith("http") else []
+        quene = []
+        try:
+            submission.comments.replace_more(limit=0)
+            comments = [comment.body for comment in 
+                        submission.comments.list()]
+            #extract all the links from posts and comments
+            for comment in comments:
+                subreddits = self.extract_subreddits(comment)
+                external_links = self.extract_urls(comment)
+                print("REDDIT",external_links)
+                quene.append(external_links)
 
-        html_title = self.get_html_title(submission.url) if submission.url.startswith("http") and not submission.url.endswith(".jpg") else None
-
-        post_dict = {
-            "id": submission.id,
-            "title": submission.title,
-            "author": str(submission.author),
-            "score": submission.score,
-            "subreddit": submission.subreddit.display_name,
-            "created_utc": submission.created_utc,
-            "url": submission.url,
-            "selftext": submission.selftext,
-            "num_comments": submission.num_comments,
-            "comments": comments,
-        }
-
-        if html_title:
-            post_dict["url_title"] = html_title
-
-        self.save_to_json(post_dict)
+                for subreddit in subreddits:
+                    subreddit = self.reddit.subreddit(subreddit)
+                    posts = subreddit.new(limit=100)  # Fetch newest 100 posts
+                    print("POSTS", posts)
+        #raising error if something goes wrong
+        except Exception as e:
+            raise  ParseError(str(e))
 
         if self.debug:
             print(f"Thread {self.thread_id} saved post: {submission.id}")
