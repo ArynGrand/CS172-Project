@@ -181,6 +181,17 @@ class Crawler:
         return [m[0] or m[1] for m in matches]
     
     def parse_submission(self, submission):
+        postData= { #download data and info
+        "id":          submission.id,
+        "subreddit":   submission.subreddit.display_name,
+        "author":      str(submission.author),
+        "created_utc": submission.created_utc,
+        "title":       submission.title,
+        "selftext":    submission.selftext,
+        "url":         submission.url,
+        }
+        self.save_to_json(postData) #call saving function
+
         quene = []
         try:
             submission.comments.replace_more(limit=0)
