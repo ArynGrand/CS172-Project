@@ -49,7 +49,7 @@ class Crawler:
         self.queues     = [manager.Queue() for _ in range(num_procs)]
         self.reddit     = self.get_reddit() # PRAW API
         self.sleep_time = 0.5 # time to sleep if the queue is empty
-
+        self.sub_map = {} #needed for hashmap
         self.load_seeds()
 
         # Each proc runs the spider method with its thread_id(i)
@@ -194,8 +194,22 @@ class Crawler:
                 quene.append(external_links)
 
                 for subreddit in subreddits:
+                    #print("SUBREDDIT", subreddit) #for testing what subreddits are being grabbed
+                    key = subreddit.lower() #map name to key(.lower to avoid same reddits)
+                    if key not in self.sub_map: #assign hash map iif sub has not been seen
+                        self.sub_map[key] = hash(key) % len(self.queues)
+                    qIndex = self.sub_map[key] #assign queue Index to the key
+
+                    for link in external_links: 
+                        self.queues[qIndex].put(link)  #added queue index of link to enqueue
+
                     subreddit = self.reddit.subreddit(subreddit)
                     posts = subreddit.new(limit=100)  # Fetch newest 100 posts
+                    for post in posts: #now queues the post onto the same spyder
+                        self.queues[qIndex].put(post.url)
+
+                    # if self.debug:
+                    #     print(f"[T{self.thread_id}] queued {post.url} → queue {qIndex}")
                     print("POSTS", posts)
         #raising error if something goes wrong
         except Exception as e:
