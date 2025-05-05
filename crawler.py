@@ -53,6 +53,8 @@ class Crawler:
         self.sleep_time = 5 # time to sleep if the queue is empty
         self.load_seeds()
 
+        self.visited    = set()
+
         # Each proc runs the spider method with its thread_id(i)
         procs = [Process(target=self.spider, args=(i,))
                  for i in range(num_procs)]
@@ -137,6 +139,12 @@ class Crawler:
 
     # Parse a given url, make a submission object to start parsing data
     def parse_url(self, url):
+        if url in self.visited:
+            if self.debug:
+                print(f"Thread {self.thread_id} already visited {url}")
+            return
+        self.visited.add(url)
+
         # only try again if we get a 429 error for too many requests
         while True:
             try:
@@ -184,7 +192,7 @@ class Crawler:
         links = self.extract_urls(comment.body)
         for subreddit in subreddits:
             subreddit = self.reddit.subreddit(subreddit)
-            posts = subreddit.new(limit=100)
+            posts = subreddit.new(limit=1000)
             for post in posts:
                 self.queues[self.hash(post.url)].put(post.url)
         for link in links:
@@ -262,9 +270,9 @@ if __name__ == "__main__":
     crawler = Crawler(
                 seed_file="seeds.txt",
                 num_pages=None,
-                size_limit=10*1024*1024*1024, # 10 GB
+                size_limit=500*1024*1024, # 500 MB
                 output_dir="output",
                 num_procs=16,
-                timeout=5*60, # 5 minutes
-                debug=False
+                timeout=30*60, # 30 minutes
+                debug=True
             )
