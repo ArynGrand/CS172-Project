@@ -10,7 +10,7 @@ import re #package for reg ex expressions
 
 # root needs a .env file with:
 # CLIENT_ID, CLIENT_SECRET, USER_AGENT, USER_ID, USER_PASS
-# eg: 
+# eg:
 # CLIENT_ID="some_id"
 # CLIENT_SECRET="some_secret_key"...
 load_dotenv()
@@ -23,12 +23,12 @@ load_dotenv()
 # hash the subreddit name and send the **url** to the corresponding queue
 #                                      ^^^^^^^
 class Crawler:
-    def __init__(self, seed_file, num_pages, size_limit, output_dir, 
-                 num_procs, timeout, debug=False):
+    def __init__(self, seed_file, num_pages, size_limit, output_dir,
+                 num_procs, debug=False):
         # Each process has its own memory space
         # all self.* variables are NOT shared data
         # shared data is explicitly created
-        
+
         start_time = time.time()
         start_size = size_limit
 
@@ -41,19 +41,19 @@ class Crawler:
         self.size_limit = Value('q', size_limit) # total amount of data to store
         self.output_dir = output_dir # directory to save files
         self.num_procs  = num_procs # number of processes to spawn
-        self.timeout    = timeout # timeout in seconds for each proc
         self.debug      = debug # debug mode
-        
+
         # queues are shared data
         # each process can send data to the other processes through its queue
         # the manager simply creates a shared memory region to place the queues
         manager         = Manager()
         self.queues     = [manager.Queue() for _ in range(num_procs)]
         self.reddit     = self.get_reddit() # PRAW API
-        self.sleep_time = 5 # time to sleep if the queue is empty
         self.load_seeds()
 
         self.visited    = set()
+
+        self.stop_all_threads = Value("b", 0)
 
         # Each proc runs the spider method with its thread_id(i)
         procs = [Process(target=self.spider, args=(i,))
@@ -63,9 +63,17 @@ class Crawler:
         for proc in procs:
             proc.start()
 
-        # wait for all the processes to finish
+        while self.stop_all_threads.value==0:
+            time.sleep(15)
+            s = [x.qsize() for x in self.queues]
+            print(f"Queues: {s}")
+            if sum(s) == 0:
+                self.stop_all_threads.value=1
+
+
+        # if any thread is done terminate the rest
         for proc in procs:
-            proc.join()
+            proc.terminate()
 
         if self.num_pages.value <= 0:
             print("All pages processed.")
@@ -78,7 +86,7 @@ class Crawler:
         print(f"Processed {sz} bytes in {time.time() - start_time:.2f} seconds")
 
     # Create a PRAW Reddit instance using credentials from .env file
-    def get_reddit(self): 
+    def get_reddit(self):
         reddit = praw.Reddit(
             client_id=os.getenv("CLIENT_ID"),
             client_secret=os.getenv("CLIENT_SECRET"),
@@ -112,36 +120,23 @@ class Crawler:
         self.thread_id = thread_id
         # ^^ note that self.thread_id can be used to identify
         # the thread from any other method
-        
+
         print(f"Thread {thread_id} started.")
         # While there are still pages to process
         # no lock is aquired to just read the value
         while self.num_pages.value > 0 and self.size_limit.value > 0:
-            try:
-                # Queue.get() will raise an exception if the queue is empty
-                # block=False means that the thread will not stall waiting
-                # for a new item to be inserted
-                url = self.queues[self.thread_id].get(block=False)
-            except Exception as e:
-                # If the queue is empty, wait a bit and try again
-                # if we wait too much the thread will *unalive* itself
-                self.timeout -= self.sleep_time
-                if self.timeout < 0:
-                    print(f"Thread {self.thread_id} timed out.")
-                    return
-                if self.debug:
-                    print(f"Thread {self.thread_id} waiting...")
-                time.sleep(self.sleep_time)
-                continue
+            # will block until there is something in the queue
+            url = self.queues[self.thread_id].get()
 
             # If we got a url do some work with it
             self.parse_url(url)
 
+        self.stop_all_threads.value = 1
+
     # Parse a given url, make a submission object to start parsing data
     def parse_url(self, url):
         if url in self.visited:
-            if self.debug:
-                print(f"Thread {self.thread_id} already visited {url}")
+            print(f"Thread {self.thread_id} already visited {url}")
             return
         self.visited.add(url)
 
@@ -150,16 +145,16 @@ class Crawler:
             try:
                 if self.debug:
                     print(f"Thread {self.thread_id} processesing URL: {url}")
-           
+
                 self.parse_submission(self.reddit.submission(url=url))
 
                 # if we successfully got the submission and data,
                 # count this page as processed
                 with self.num_pages.get_lock():
                     self.num_pages.value -= 1
-            
+
                 break
-        
+
             except Exception as e:
                 if str(e) == "received 429 HTTP response":
                     print(f"Thread {self.thread_id} rate limited. Sleeping...")
@@ -173,7 +168,7 @@ class Crawler:
         pattern = re.compile(r'r/([A-Za-z0-9_]+)')
         # findall returns a list of capture‐group strings
         return pattern.findall(text)
-    
+
     # Given some text extract all the urls in the form (http://*) or (https://*)
     def extract_urls(self, text: str) -> list[str]:
         URL_REGEX = re.compile(
@@ -181,7 +176,7 @@ class Crawler:
             flags=re.IGNORECASE
         )
         return URL_REGEX.findall(text)
-    
+
     # Hash a value to determine which queue to send it to
     def hash(self, value):
         return abs(hash(value)) % self.num_procs
@@ -230,7 +225,7 @@ class Crawler:
             "selftext":       submission.selftext,
             "url":            submission.url,
             "comments":       comments,
-            "external_links": external_links 
+            "external_links": external_links
         }
         self.save_to_json(postData) #call saving function
 
@@ -273,6 +268,5 @@ if __name__ == "__main__":
                 size_limit=500*1024*1024, # 500 MB
                 output_dir="output",
                 num_procs=16,
-                timeout=30*60, # 30 minutes
-                debug=True
+                debug=False
             )
