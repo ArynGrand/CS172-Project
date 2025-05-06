@@ -6,72 +6,47 @@ from multiprocessing import Manager, Process, Value
 import requests
 from bs4 import BeautifulSoup
 import time
-import re #package for reg ex expressions
+import re
+import argparse
 
-# root needs a .env file with:
-# CLIENT_ID, CLIENT_SECRET, USER_AGENT, USER_ID, USER_PASS
-# eg:
-# CLIENT_ID="some_id"
-# CLIENT_SECRET="some_secret_key"...
 load_dotenv()
 
-# Crawler class handles each Spider thread
-# Each Spider has its own memory space, with some shared data
-# Spiders can send data to each other through a shared list of queues
-# Each Spider has its own queue that it reads from using its thread_id
-# To determine which Spider is in charge of a specific reddit post we
-# hash the subreddit name and send the **url** to the corresponding queue
-#                                      ^^^^^^^
 class Crawler:
     def __init__(self, seed_file, num_pages, size_limit, output_dir,
-                 num_procs, debug=False):
-        # Each process has its own memory space
-        # all self.* variables are NOT shared data
-        # shared data is explicitly created
-
+                 num_procs, debug=False, hops_away=1, timeout=60):
         start_time = time.time()
         start_size = size_limit
 
         if num_pages is None:
             num_pages = 9_223_372_036_854_775_807
 
-        self.seed_file  = seed_file # file with reddit urls to start from
-        # num_pages is shared data. The total number of pages to be processed
+        self.seed_file  = seed_file
         self.num_pages  = Value('q', num_pages)
-        self.size_limit = Value('q', size_limit) # total amount of data to store
-        self.output_dir = output_dir # directory to save files
-        self.num_procs  = num_procs # number of processes to spawn
-        self.debug      = debug # debug mode
+        self.size_limit = Value('q', size_limit)
+        self.output_dir = output_dir
+        self.num_procs  = num_procs
+        self.debug      = debug
+        self.hops_away  = hops_away
+        self.timeout    = timeout
 
-        # queues are shared data
-        # each process can send data to the other processes through its queue
-        # the manager simply creates a shared memory region to place the queues
         manager         = Manager()
         self.queues     = [manager.Queue() for _ in range(num_procs)]
-        self.reddit     = self.get_reddit() # PRAW API
+        self.reddit     = self.get_reddit()
         self.load_seeds()
-
         self.visited    = set()
-
         self.stop_all_threads = Value("b", 0)
 
-        # Each proc runs the spider method with its thread_id(i)
-        procs = [Process(target=self.spider, args=(i,))
-                 for i in range(num_procs)]
-
-        # start all the processes
+        procs = [Process(target=self.spider, args=(i,)) for i in range(num_procs)]
         for proc in procs:
             proc.start()
 
-        while self.stop_all_threads.value==0:
+        while self.stop_all_threads.value == 0:
             time.sleep(15)
             s = [x.qsize() for x in self.queues]
             print(f"Queues: {s}")
             if sum(s) == 0:
-                self.stop_all_threads.value=1
+                self.stop_all_threads.value = 1
 
-
-        # if any thread is done terminate the rest
         for proc in procs:
             proc.terminate()
 
@@ -85,7 +60,6 @@ class Crawler:
         sz = start_size - self.size_limit.value
         print(f"Processed {sz} bytes in {time.time() - start_time:.2f} seconds")
 
-    # Create a PRAW Reddit instance using credentials from .env file
     def get_reddit(self):
         reddit = praw.Reddit(
             client_id=os.getenv("CLIENT_ID"),
@@ -103,7 +77,6 @@ class Crawler:
             print("Reddit instance created.")
         return reddit
 
-    # Load the seed urls from the seed file and assign them to Spiders
     def load_seeds(self):
         if not os.path.exists(self.seed_file):
             print(f"Seed file {self.seed_file} does not exist.")
@@ -115,46 +88,28 @@ class Crawler:
             self.queues[self.hash(seed)].put(seed)
         print(f"Loaded {len(seeds)} seeds from {self.seed_file}.")
 
-    # Each Spider runs this method
     def spider(self, thread_id):
         self.thread_id = thread_id
-        # ^^ note that self.thread_id can be used to identify
-        # the thread from any other method
-
         print(f"Thread {thread_id} started.")
-        # While there are still pages to process
-        # no lock is aquired to just read the value
         while self.num_pages.value > 0 and self.size_limit.value > 0:
-            # will block until there is something in the queue
             url = self.queues[self.thread_id].get()
-
-            # If we got a url do some work with it
             self.parse_url(url)
-
         self.stop_all_threads.value = 1
 
-    # Parse a given url, make a submission object to start parsing data
     def parse_url(self, url):
         if url in self.visited:
             print(f"Thread {self.thread_id} already visited {url}")
             return
         self.visited.add(url)
 
-        # only try again if we get a 429 error for too many requests
         while True:
             try:
                 if self.debug:
                     print(f"Thread {self.thread_id} processesing URL: {url}")
-
                 self.parse_submission(self.reddit.submission(url=url))
-
-                # if we successfully got the submission and data,
-                # count this page as processed
                 with self.num_pages.get_lock():
                     self.num_pages.value -= 1
-
                 break
-
             except Exception as e:
                 if str(e) == "received 429 HTTP response":
                     print(f"Thread {self.thread_id} rate limited. Sleeping...")
@@ -163,25 +118,20 @@ class Crawler:
                 print(f"Thread {self.thread_id} error processing {url}: {e}")
                 break
 
-    # Given some text extract all the subreddits in the form r/subreddit_name
     def extract_subreddits(self, text: str) -> list[str]:
         pattern = re.compile(r'r/([A-Za-z0-9_]+)')
-        # findall returns a list of capture‐group strings
         return pattern.findall(text)
 
-    # Given some text extract all the urls in the form (http://*) or (https://*)
     def extract_urls(self, text: str) -> list[str]:
         URL_REGEX = re.compile(
             r'(https?://[^\s]+)|(www\.[^\s]+)',
             flags=re.IGNORECASE
         )
-        return URL_REGEX.findall(text)
+        return [u[0] if u[0] else u[1] for u in URL_REGEX.findall(text)]
 
-    # Hash a value to determine which queue to send it to
     def hash(self, value):
         return abs(hash(value)) % self.num_procs
 
-    # Parse reddit comment, extract subreddits and links
     def parse_comment(self, comment, comments_out, links_out):
         subreddits = self.extract_subreddits(comment.body)
         links = self.extract_urls(comment.body)
@@ -192,19 +142,13 @@ class Crawler:
                 self.queues[self.hash(post.url)].put(post.url)
         for link in links:
             try:
-                # if the link is not a reddit post
-                # this will raise an error
                 submission = self.reddit.submission(url=link)
                 subreddit = submission.subreddit.display_name
                 self.queues[self.hash(subreddit)].put(submission.url)
-            except Exception as e:
+            except Exception:
                 links_out.append(link)
-
         comments_out.append(comment.body)
 
-    # parse a reddit post and save it to a file, saves:
-    # ID, Subreddit, Author, Timestamp, Title, Post text, URL,
-    # Comments, and links to non reddit.com websites
     def parse_submission(self, submission):
         comments = []
         external_links = []
@@ -216,18 +160,18 @@ class Crawler:
         if self.debug:
             print(f"Thread {self.thread_id} finished parsing comments")
 
-        postData = { #download data and info
-            "id":             submission.id,
-            "subreddit":      submission.subreddit.display_name,
-            "author":         str(submission.author),
-            "created_utc":    submission.created_utc,
-            "title":          submission.title,
-            "selftext":       submission.selftext,
-            "url":            submission.url,
-            "comments":       comments,
+        postData = {
+            "id": submission.id,
+            "subreddit": submission.subreddit.display_name,
+            "author": str(submission.author),
+            "created_utc": submission.created_utc,
+            "title": submission.title,
+            "selftext": submission.selftext,
+            "url": submission.url,
+            "comments": comments,
             "external_links": external_links
         }
-        self.save_to_json(postData) #call saving function
+        self.save_to_json(postData)
 
     def get_html_title(self, url):
         try:
@@ -252,21 +196,32 @@ class Crawler:
         with open(f"{file_prefix}_{file_index}.json", 'a', encoding='utf-8') as f:
             json.dump(post_dict, f)
             f.write("\n")
-
-        # size of this json object in bytes
-        # removes the size from the size limit
         jsz = len(json.dumps(post_dict).encode('utf-8'))
         with self.size_limit.get_lock():
             self.size_limit.value -= jsz
-
         print(f"Data remaining: {self.size_limit.value} bytes")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Reddit Post Crawler")
+
+    parser.add_argument("--seed_file", type=str, default="seeds.txt", help="Path to seed file")
+    parser.add_argument("--num_pages", type=int, default=None, help="Number of pages to collect (optional)")
+    parser.add_argument("--size_limit", type=int, default=500*1024*1024, help="Total data size limit in bytes")
+    parser.add_argument("--output_dir", type=str, default="output", help="Directory to store output JSON files")
+    parser.add_argument("--num_procs", type=int, default=16, help="Number of parallel processes")
+    parser.add_argument("--debug", action="store_true", help="Enable debug printing")
+    parser.add_argument("--hops_away", type=int, default=1, help="Number of hops to follow from each seed post")
+    parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds for each spider thread")
+
+    args = parser.parse_args()
+
     crawler = Crawler(
-                seed_file="seeds.txt",
-                num_pages=None,
-                size_limit=500*1024*1024, # 500 MB
-                output_dir="output",
-                num_procs=16,
-                debug=False
-            )
+        seed_file=args.seed_file,
+        num_pages=args.num_pages,
+        size_limit=args.size_limit,
+        output_dir=args.output_dir,
+        num_procs=args.num_procs,
+        debug=args.debug,
+        hops_away=args.hops_away,
+        timeout=args.timeout
+    )
